@@ -127,8 +127,28 @@ def storage_request(method, object_key, *, content=None):
             response = http.request(method, endpoint, headers=headers, content=content)
         response.raise_for_status()
         return response.content
-    except httpx.HTTPError as exc:
-        raise HTTPException(502, '문서 저장소 요청에 실패했습니다.') from exc
+    except httpx.HTTPStatusError as exc:
+        print("========== SUPABASE STORAGE ERROR ==========", flush=True)
+        print("STATUS CODE:", exc.response.status_code, flush=True)
+        print("ERROR BODY:", exc.response.text[:1000], flush=True)
+        print("============================================", flush=True)
+
+        raise HTTPException(
+            status_code=502,
+            detail="문서 저장소 요청에 실패했습니다.",
+        ) from exc
+
+    except httpx.RequestError as exc:
+        print("========== SUPABASE STORAGE NETWORK ERROR ==========", flush=True)
+        print("ERROR TYPE:", type(exc).__name__, flush=True)
+        print("ERROR MESSAGE:", str(exc), flush=True)
+        print("CAUSE:", repr(exc.__cause__), flush=True)
+        print("====================================================", flush=True)
+
+        raise HTTPException(
+            status_code=502,
+            detail="문서 저장소 연결에 실패했습니다.",
+        ) from exc
 
 def document_response(object_key):
     if not object_key:
