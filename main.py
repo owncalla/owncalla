@@ -1062,7 +1062,7 @@ def generate_diary(data: GenerateDiaryInput, user=Depends(require_teacher)):
             detail="AI 응답을 보육일지 형식으로 변환하지 못했습니다.",
         )
 
-        except Exception as e:
+    except Exception as e:
         import traceback
 
         print("========== OPENAI ERROR ==========", flush=True)
