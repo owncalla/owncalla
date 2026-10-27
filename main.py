@@ -1227,7 +1227,7 @@ def save_diary(data: SaveDiaryInput, user=Depends(require_teacher)):
         ) or f"child_{child['id']}"
         draft_filename = f"{safe_child_name}_{diary_date}_보육일지_초안_{diary_id}.hwpx"
         draft_path = os.path.join(DRAFT_DIR, draft_filename)
-        draft_key = f"draft/{diary_id}/{draft_filename}"
+        draft_key = f"draft/{diary_id}/diary_draft_{diary_id}.hwpx"
 
         document_data = {
             "child_name": child_name,
@@ -1476,7 +1476,7 @@ async def upload_reviewed_document(
                     raise ValueError('올바른 HWPX 구조가 아닙니다.')
         except (zipfile.BadZipFile, ValueError) as exc:
             raise HTTPException(400, '올바른 HWPX 파일이 아닙니다.') from exc
-        final_key = f'final/{diary_id}/{final_filename}'
+        final_key = f'final/{diary_id}/diary_final_{diary_id}.hwpx'
         storage_request('POST', final_key, content=content)
 
         conn.execute(
