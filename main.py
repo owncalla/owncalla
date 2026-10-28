@@ -548,13 +548,21 @@ def public_diary(row):
 async def recognize_photo(file: UploadFile = File(...), user=Depends(require_teacher)):
     if client is None:
         raise HTTPException(status_code=503, detail="OpenAI API Key가 설정되지 않았습니다.")
-    allowed = {"image/jpeg", "image/png", "image/webp", "image/gif"}
-    mime = (file.content_type or "").lower()
-    if mime not in allowed:
-        raise HTTPException(status_code=415, detail="JPG, PNG, WEBP, GIF 이미지만 지원합니다.")
+    # Flutter Web의 MultipartFile.fromBytes는 Content-Type을
+    # application/octet-stream으로 전송할 수 있으므로 실제 파일 바이트로 판별합니다.
     content = await file.read(10 * 1024 * 1024 + 1)
     if not content or len(content) > 10 * 1024 * 1024:
         raise HTTPException(status_code=413, detail="이미지는 10MB 이하여야 합니다.")
+    if content.startswith(b"\xff\xd8\xff"):
+        mime = "image/jpeg"
+    elif content.startswith(b"\x89PNG\r\n\x1a\n"):
+        mime = "image/png"
+    elif content.startswith((b"GIF87a", b"GIF89a")):
+        mime = "image/gif"
+    elif len(content) >= 12 and content[:4] == b"RIFF" and content[8:12] == b"WEBP":
+        mime = "image/webp"
+    else:
+        raise HTTPException(status_code=415, detail="JPG, PNG, WEBP, GIF 이미지만 지원합니다.")
     image_data = base64.b64encode(content).decode("ascii")
     try:
         result = client.responses.create(
