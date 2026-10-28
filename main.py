@@ -1,4 +1,4 @@
-import os
+\import os
 import base64
 import json
 import psycopg
@@ -538,11 +538,10 @@ def assert_diary_access(conn, user, diary, *, draft=False):
 
 
 def public_diary(row):
-    # DB 파일 경로와 교사용 OCR 원문은 보호자에게 전달하지 않습니다.
-    result = dict(row)
-    for key in ("draft_document_path", "final_document_path", "original_ocr"):
-        result.pop(key, None)
-    return result
+    data = dict(row)
+    # 보호자에게는 검수 완료 일지만 노출하며, 원본 OCR은 제외
+    data.pop("original_ocr", None)
+    return data
 
 @app.post("/ocr")
 async def recognize_photo(file: UploadFile = File(...), user=Depends(require_teacher)):
@@ -580,13 +579,8 @@ async def recognize_photo(file: UploadFile = File(...), user=Depends(require_tea
 @app.get("/me")
 def get_me(user=Depends(current_user)):
     with get_db() as conn:
-        child = conn.execute(
-            "SELECT name FROM children WHERE guardian_id = ? ORDER BY id LIMIT 1",
-            (user["id"],),
-        ).fetchone() if user["role"] == "guardian" else None
-    return {"id": user["id"], "name": user["name"],
-            "email": user["email"], "role": user["role"],
-            "child_name": child["name"] if child else ""}
+        child = conn.execute("SELECT name FROM children WHERE guardian_id = ? ORDER BY id LIMIT 1", (user["id"],)).fetchone() if user["role"] == "guardian" else None
+    return {"user": {"id": user["id"], "name": user["name"], "email": user["email"], "role": user["role"], "child_name": child["name"] if child else ""}}
 
 
 @app.post("/logout")
@@ -892,138 +886,44 @@ def generate_diary(data: GenerateDiaryInput, user=Depends(require_teacher)):
         )
 
     prompt = f"""
-너는 어린이집 및 유치원 교사의
-'개별 유아 보육일지' 작성을 보조하는 AI이다.
+너는 어린이집 교사의 개별 유아 보육일지 작성 보조 AI이다.
+다음 OCR 교사 메모에 기록된 사실만 근거로 보육일지를 작성하라.
+없는 시간, 놀이, 발화, 교사의 행동을 만들어내지 마라.
+시간이 없는 내용은 시간대별 schedule에 임의 배정하지 말고 하단 서술 항목에만 반영하라.
+명확한 시각이나 시간 범위가 기록된 활동만 schedule에 넣어라.
+동일 시간대에 여러 활동이 있으면 같은 시간 슬롯에 합쳐도 된다.
+09:00~18:00의 각 정시 구간에 겹치는 기록만 배치한다.
+기록된 시간 범위를 넘어 활동을 확장하지 않는다.
+교사의 기대는 원본 메모에 근거한 교육적 기대를 작성하되 근거가 없으면 빈 문자열로 둔다.
+생활주제, 주제, 소주제도 원본 메모에 근거해 간결하게 작성하고, 불분명하면 빈 문자열로 둔다.
+특이사항이 없으면 빈 문자열로 둔다. 의학적 진단을 추측하지 마라.
 
-아래의 교사 메모는 교사가 실제 놀이 상황을 관찰한 뒤
-직접 작성한 키워드 또는 짧은 문장을 OCR로 인식한 것이다.
+[기본 정보]
+유아명: {data.child_name}
+반명: {data.class_name}
+연령: {data.age}
+교사: {data.teacher_name}
+생활주제 참고: {data.life_theme}
+주제 참고: {data.theme}
+소주제 참고: {data.subtheme}
+교사의 기대 참고: {data.teacher_expectation}
 
-이 기록만을 근거로 개별 유아 보육일지를 작성하라.
-
-
-[유아 기본 정보]
-
-유아명:
-{data.child_name}
-
-반명:
-{data.class_name}
-
-연령:
-{data.age}
-
-담당교사:
-{data.teacher_name}
-
-
-[교사가 작성한 원본 메모]
-
+[교사 메모 OCR]
 {ocr_text}
 
-
-==================================================
-
-[작성 원칙]
-
-1. 원본 메모에 없는 구체적인 사건을 만들어내지 않는다.
-
-2. 유아가 실제로 하지 않은 말이나 행동을
-직접 인용 형태로 만들어내지 않는다.
-
-3. 질병, 장애, 발달지연, 성격 등을 임의로 진단하거나 단정하지 않는다.
-
-4. 유아의 행동은 객관적인 관찰 표현을 우선한다.
-
-5. 교사의 지원은 교육적으로 자연스럽게 정리하되
-실제 기록에서 추론할 수 있는 범위를 넘어서지 않는다.
-
-6. 부모에게 전달하기 부적절한 단정적 표현이나
-부정적인 낙인 표현을 사용하지 않는다.
-
-7. 특이사항에 대한 정보가 없으면 빈 문자열로 둔다.
-
-8. 가정 연계와 관련된 정보가 전혀 없다면
-무리해서 사실을 만들지 말고
-해당 놀이를 가정에서 자연스럽게 이어갈 수 있는
-일반적인 제안 수준으로 작성한다.
-
-9. 각 항목은 서로 같은 문장을 반복하지 않는다.
-
-10. 실제 교사가 기록한 것처럼
-자연스럽고 전문적인 한국어로 작성한다.
-
-11. 결과에는 설명을 붙이지 않는다.
-
-12. 반드시 JSON 객체 하나만 반환한다.
-
-13. Markdown 코드블록을 절대 사용하지 않는다.
-
-
-==================================================
-
-다음 8개 항목을 작성한다.
-
-
-1. main_activity
-오늘의 주요 놀이 및 활동.
-오늘 어떤 놀이와 활동을 경험했는지 간결하게 작성한다.
-
-
-2. activity_process
-놀이 및 활동 과정.
-유아가 무엇을 어떻게 했는지 구체적으로 작성한다.
-
-
-3. child_response
-유아의 반응 및 행동.
-놀이 중 나타난 말, 행동, 감정,
-또래와의 상호작용 등을 관찰 중심으로 작성한다.
-
-
-4. teacher_support
-교사의 지원 및 상호작용.
-교사가 제공한 도움, 질문, 자료,
-환경 등의 지원을 작성한다.
-
-
-5. observation_evaluation
-관찰 및 평가.
-오늘의 놀이를 통해 보인 유아의 관심,
-변화, 배움 등을 종합적으로 작성한다.
-
-
-6. future_support
-추후 지원 계획.
-다음 놀이에서 지원할 내용,
-환경, 자료 등을 작성한다.
-
-
-7. special_notes
-특이사항.
-건강, 식사, 수면, 기분 등
-원본 메모에 특별히 기록할 사항이 있는 경우 작성한다.
-정보가 없으면 빈 문자열로 둔다.
-
-
-8. family_connection
-가정 연계사항.
-보호자에게 전달할 내용이나
-가정과의 연계가 필요한 사항을 작성한다.
-
-
-==================================================
-
-반드시 아래 JSON 구조로만 출력한다.
-
+반드시 다음 JSON 객체만 출력한다. 마크다운 금지.
+키 이름은 영문 그대로 유지한다.
+각 schedule 원소의 time은 '09:00~10:00' 같은 정시 구간이며
+activity=일과 및 활동, activity_process=활동내용 및 실행,
+child_response=유아의 놀이모습, teacher_support=교사의 지원 및 평가,
+remarks=비고이다.
+확인되지 않은 세부 내용은 빈 문자열로 둔다.
 {{
-    "main_activity": "",
-    "activity_process": "",
-    "child_response": "",
-    "teacher_support": "",
-    "observation_evaluation": "",
-    "future_support": "",
-    "special_notes": "",
-    "family_connection": ""
+ "life_theme": "", "theme": "", "subtheme": "", "teacher_expectation": "",
+ "schedule": [{{"time": "09:00~10:00", "activity": "", "activity_process": "", "child_response": "", "teacher_support": "", "remarks": ""}}],
+ "main_activity": "", "activity_process": "", "child_response": "",
+ "teacher_support": "", "observation_evaluation": "", "future_support": "",
+ "special_notes": "", "family_connection": ""
 }}
 """
 
@@ -1054,30 +954,28 @@ def generate_diary(data: GenerateDiaryInput, user=Depends(require_teacher)):
         result = json.loads(output)
 
         fields = [
-            "main_activity",
-            "activity_process",
-            "child_response",
-            "teacher_support",
-            "observation_evaluation",
-            "future_support",
-            "special_notes",
-            "family_connection",
+            "life_theme", "theme", "subtheme", "teacher_expectation",
+            "main_activity", "activity_process", "child_response", "teacher_support",
+            "observation_evaluation", "future_support", "special_notes", "family_connection",
         ]
-
         clean_result = {}
-
         for field in fields:
-
             value = result.get(field, "")
+            clean_result[field] = str(value).strip() if value is not None else ""
 
-            if value is None:
-                value = ""
-
-            clean_result[field] = str(value).strip()
-
-        # A structured timetable is derived only from explicit times in the note.
-        # The teacher can complete all remaining time slots manually.
+        # AI가 만든 시간대 중 09~18시 정시 구간만 허용
+        valid_times = {f"{h:02d}:00~{h+1:02d}:00" for h in range(9, 18)}
         clean_result["schedule"] = []
+        for item in result.get("schedule", []):
+            if not isinstance(item, dict):
+                continue
+            time = str(item.get("time", "")).strip().replace(" ", "")
+            if time not in valid_times:
+                continue
+            clean_result["schedule"].append({
+                key: str(item.get(key) or "").strip()
+                for key in ("time", "activity", "activity_process", "child_response", "teacher_support", "remarks")
+            } | {"time": time})
         return clean_result
 
     except json.JSONDecodeError as e:
