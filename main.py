@@ -42,6 +42,9 @@ from pydantic import (
 
 from hwpx_generator import generate_hwpx
 
+# Timezone 라이브러리 추가
+from zoneinfo import ZoneInfo
+
 # =========================================================
 # 기본 설정
 # =========================================================
@@ -80,17 +83,18 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+KST = ZoneInfo("Asia/Seoul")
 
 # =========================================================
 # 공통 함수
 # =========================================================
 
 def now_text():
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    return datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def today_text():
-    return datetime.now().strftime("%Y-%m-%d")
+    return datetime.now(KST).strftime("%Y-%m-%d")
 
 
 class DBConnection:
