@@ -1393,7 +1393,7 @@ def delete_diary(diary_id: int, user=Depends(require_teacher)):
 
         diary = conn.execute(
             """
-            SELECT id
+            SELECT id, draft_document_path, final_document_path
             FROM child_diaries
             WHERE id = ?
             """,
@@ -1415,10 +1415,19 @@ def delete_diary(diary_id: int, user=Depends(require_teacher)):
             (diary_id,),
         )
 
-        return {
-            "success": True,
-            "message": "보육일지가 삭제되었습니다.",
-        }
+    # 데이터베이스 삭제 후 Supabase의 연결 문서도 정리합니다.
+    # Storage 장애가 발생해도 삭제된 일지가 다시 나타나지 않도록 처리합니다.
+    for object_key in (diary.get("draft_document_path"), diary.get("final_document_path")):
+        if object_key and object_key.startswith((f"draft/{diary_id}/", f"final/{diary_id}/")):
+            try:
+                storage_request("DELETE", object_key)
+            except Exception as exc:
+                print(f"Diary {diary_id} storage cleanup failed: {exc}", flush=True)
+
+    return {
+        "success": True,
+        "message": "보육일지가 삭제되었습니다.",
+    }
 
 
 # =========================================================
@@ -1811,13 +1820,13 @@ def complete_medication(medication_id: int, user=Depends(require_teacher)):
 # =========================================================
 
 @app.delete("/medications/{medication_id}")
-def delete_medication(medication_id: int, user=Depends(require_teacher)):
+def delete_medication(medication_id: int, user=Depends(current_user)):
 
     with get_db() as conn:
 
         medication = conn.execute(
             """
-            SELECT id
+            SELECT id, child_id, child_name
             FROM medications
             WHERE id = ?
             """,
@@ -1830,6 +1839,17 @@ def delete_medication(medication_id: int, user=Depends(require_teacher)):
                 status_code=404,
                 detail="투약 정보를 찾을 수 없습니다.",
             )
+
+        if user["role"] == "guardian":
+            # 보호자는 본인과 연결된 유아의 기록만 삭제할 수 있습니다.
+            owned = conn.execute(
+                "SELECT id FROM children WHERE guardian_id = ? AND (id = ? OR name = ?)",
+                (user["id"], medication["child_id"], medication["child_name"]),
+            ).fetchone()
+            if owned is None:
+                raise HTTPException(status_code=403, detail="연결된 유아의 투약기록만 삭제할 수 있습니다.")
+        elif user["role"] != "teacher":
+            raise HTTPException(status_code=403, detail="삭제 권한이 없습니다.")
 
         conn.execute(
             """
