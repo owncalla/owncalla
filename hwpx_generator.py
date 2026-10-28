@@ -126,3 +126,78 @@ def generate_hwpx(template_path, output_path, data):
     template_path = Path(template_path)
     output_path = Path(output_path)
     if not template_path.is_file():
+        raise FileNotFoundError(
+            f"HWPX template missing: {template_path}"
+        )
+
+    with zipfile.ZipFile(template_path, "r") as src:
+        archive = [(info, src.read(info.filename)) for info in src.infolist()]
+
+    section_name = "Contents/section0.xml"
+    files = dict((info.filename, raw) for info, raw in archive)
+    if section_name not in files:
+        raise ValueError("HWPX template has no Contents/section0.xml")
+
+    root = etree.fromstring(files[section_name])
+    tables = root.findall(".//" + TBL)
+    _assert_template(tables)
+
+    header = cells(tables[1])
+    header_values = {
+        (0, 1): data.get("diary_date", ""),
+        (0, 3): data.get("teacher_name", ""),
+        (1, 1): data.get("child_name", ""),
+        (1, 3): data.get("class_name", ""),
+        (1, 5): data.get("age", ""),
+        (2, 1): data.get("life_theme", ""),
+        (2, 3): data.get("theme", ""),
+        (2, 5): data.get("subtheme", ""),
+        (3, 1): data.get("teacher_expectation", ""),
+    }
+    for (row, col), value in header_values.items():
+        if row < len(header) and col < len(header[row]):
+            put(header[row][col], value)
+
+    grid = cells(tables[2])
+    for i, item in enumerate(data.get("schedule") or []):
+        if i + 1 >= len(grid):
+            break
+        row = grid[i + 1]
+        for col, field in (
+            (0, "time"), (1, "activity"), (2, "activity_process"),
+            (3, "child_response"), (4, "teacher_support"), (5, "remarks")
+        ):
+            if col < len(row):
+                put(row[col], item.get(field, ""))
+
+    # The evaluation section of the supplied template is intended for the
+    # evaluation and next-step plan, not a repeat of all other diary fields.
+    evaluation = "\n".join(
+        str(value).strip()
+        for value in (data.get("observation_evaluation"), data.get("future_support"))
+        if str(value or "").strip()
+    )
+    summary = (data.get("special_notes", ""), evaluation, data.get("family_connection", ""))
+    for idx, value in enumerate(summary, start=3):
+        rows = cells(tables[idx])
+        if len(rows) > 1 and rows[1]:
+            put(rows[1][0], value)
+
+    _fix_table_flow(root, tables)
+    files[section_name] = etree.tostring(root, encoding="UTF-8", xml_declaration=True)
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(output_path, "w") as dst:
+        for info, raw in archive:
+            dst.writestr(info, files.get(info.filename, raw))
+
+    with zipfile.ZipFile(output_path, "r") as check:
+        if check.testzip() is not None:
+            raise ValueError("Generated HWPX archive is corrupt")
+        result_root = etree.fromstring(check.read(section_name))
+        final_tables = result_root.findall(".//" + TBL)
+        _assert_template(final_tables)
+        if len(result_root.findall(P)) != 6:
+            raise ValueError("Unexpected output paragraph/table order")
+        if any(tbl.find(tag("pos")).get("treatAsChar") != "1" for tbl in final_tables[1:]):
+            raise ValueError("Output table flow was not normalized")
