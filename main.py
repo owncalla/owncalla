@@ -936,6 +936,65 @@ def _normalize_ai_schedule(raw_schedule) -> list[dict]:
     return list(timetable.values())
 
 
+def validate_schedule(raw_schedule):
+    """Validate AI/teacher timetable data and return one row per 09:00-18:00 slot.
+
+    - Reject out-of-range or malformed time labels.
+    - Detect repeated time ranges; preserve distinct activity notes by merging
+      them into their matching hour instead of silently discarding them.
+    - Keep missing activity hours empty (never invent observations).
+    This function is pure: it does not use OpenAI, the database, or HWPX.
+    """
+    valid_items = []
+    seen_time_ranges = set()
+    duplicate_times = []
+    invalid_times = []
+
+    for item in raw_schedule if isinstance(raw_schedule, list) else []:
+        if not isinstance(item, dict):
+            invalid_times.append("(잘못된 시간표 항목)")
+            continue
+
+        label = str(item.get("time") or "").strip()
+        interval = TIME_RANGE.search(label)
+        if interval:
+            sh, sm, eh, em = (int(v) for v in interval.groups())
+            start, end = sh * 60 + sm, eh * 60 + em
+            key = ("interval", start, end)
+            is_valid = 9 * 60 <= start < end <= 18 * 60
+        else:
+            point = TIME_POINT.search(label)
+            if point:
+                hour, minute = (int(v) for v in point.groups())
+                start = hour * 60 + minute
+                key = ("point", start)
+                is_valid = 9 * 60 <= start < 18 * 60
+            else:
+                key, is_valid = None, False
+
+        if not is_valid:
+            invalid_times.append(label or "(시간 없음)")
+            continue
+        if key in seen_time_ranges and label not in duplicate_times:
+            duplicate_times.append(label)
+        seen_time_ranges.add(key)
+        valid_items.append(item)
+
+    # Use the existing, tested normalization: minute ranges are mapped to their
+    # overlapping hour slots, and distinct contents are merged per cell.
+    result = _normalize_ai_schedule(valid_items)
+    empty_slots = [
+        row["time"] for row in result
+        if not any(str(row.get(key) or "").strip() for key in SCHEDULE_KEYS)
+    ]
+    validation = {
+        "duplicate_times": duplicate_times,
+        "invalid_times": invalid_times,
+        "empty_slots": empty_slots,
+    }
+    return result, validation
+
+
 def _parse_ai_json(text: str) -> dict:
     raw = text.strip()
     if raw.startswith('```'):
@@ -1007,7 +1066,7 @@ def generate_diary(data: GenerateDiaryInput, user=Depends(require_teacher)):
         clean_result = {
             field: str(result.get(field) or '').strip() for field in fields
         }
-        clean_result['schedule'] = _normalize_ai_schedule(result.get('schedule'))
+        clean_result['schedule'], schedule_validation = validate_schedule(result.get('schedule'))
 
         # If the OCR clearly mentions other hours but the AI missed them,
         # make one targeted repair request instead of silently losing the day.
@@ -1031,7 +1090,12 @@ def generate_diary(data: GenerateDiaryInput, user=Depends(require_teacher)):
                 repaired = _parse_ai_json(
                     client.responses.create(model=OPENAI_MODEL, input=repair_prompt).output_text
                 )
-                additions = _normalize_ai_schedule(repaired.get('schedule'))
+                additions, repair_validation = validate_schedule(repaired.get('schedule'))
+                for key in ("duplicate_times", "invalid_times"):
+                    schedule_validation[key].extend(
+                        t for t in repair_validation[key]
+                        if t not in schedule_validation[key]
+                    )
                 by_time = {row['time']: row for row in clean_result['schedule']}
                 for row in additions:
                     if row['time'] not in missing:
@@ -1042,6 +1106,12 @@ def generate_diary(data: GenerateDiaryInput, user=Depends(require_teacher)):
             except Exception as exc:
                 # 보완 API가 실패해도 정상 생성된 내용까지 잃지 않게 유지한다.
                 print('AI timetable repair skipped:', type(exc).__name__, flush=True)
+        # Keep diagnostics optional, so existing Flutter schedule parsing works.
+        schedule_validation["empty_slots"] = [
+            row["time"] for row in clean_result["schedule"]
+            if not any(str(row.get(key) or "").strip() for key in SCHEDULE_KEYS)
+        ]
+        clean_result["schedule_validation"] = schedule_validation
         return clean_result
 
     except (json.JSONDecodeError, ValueError) as exc:
@@ -1173,6 +1243,12 @@ def save_diary(data: SaveDiaryInput, user=Depends(require_teacher)):
         draft_path = os.path.join(DRAFT_DIR, draft_filename)
         draft_key = f"draft/{diary_id}/diary_draft_{diary_id}.hwpx"
 
+        # Server-side safety check: reject invalid time labels and merge
+        # duplicate slots even if a client submits /save directly.
+        checked_schedule, _ = validate_schedule(
+            [item.model_dump() for item in data.schedule]
+        )
+
         document_data = {
             "child_name": child_name,
             "class_name": class_name,
@@ -1183,7 +1259,7 @@ def save_diary(data: SaveDiaryInput, user=Depends(require_teacher)):
             "theme": data.theme.strip(),
             "subtheme": data.subtheme.strip(),
             "teacher_expectation": data.teacher_expectation.strip(),
-            "schedule": [item.model_dump() for item in data.schedule],
+            "schedule": checked_schedule,
             "main_activity": data.main_activity.strip(),
             "activity_process": data.activity_process.strip(),
             "child_response": data.child_response.strip(),
@@ -1225,7 +1301,7 @@ def save_diary(data: SaveDiaryInput, user=Depends(require_teacher)):
                 data.theme.strip(),
                 data.subtheme.strip(),
                 data.teacher_expectation.strip(),
-                json.dumps([item.model_dump() for item in data.schedule], ensure_ascii=False),
+                json.dumps(checked_schedule, ensure_ascii=False),
                 now_text(),
                 diary_id,
             ),
