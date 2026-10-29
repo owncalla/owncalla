@@ -126,9 +126,7 @@ def generate_hwpx(template_path, output_path, data):
     template_path = Path(template_path)
     output_path = Path(output_path)
     if not template_path.is_file():
-        raise FileNotFoundError(
-            f"HWPX template missing: {template_path}"
-        )
+        raise FileNotFoundError(f"HWPX template missing: {template_path}")
 
     with zipfile.ZipFile(template_path, "r") as src:
         archive = [(info, src.read(info.filename)) for info in src.infolist()]
@@ -158,17 +156,25 @@ def generate_hwpx(template_path, output_path, data):
         if row < len(header) and col < len(header[row]):
             put(header[row][col], value)
 
+    # Always fill the corresponding time row, not the input list position.
     grid = cells(tables[2])
-    for i, item in enumerate(data.get("schedule") or []):
+    slot_names = [f"{hour:02d}:00~{hour + 1:02d}:00" for hour in range(9, 18)]
+    by_time = {
+        str(item.get("time", "")).replace(" ", "").replace("-", "~"): item
+        for item in (data.get("schedule") or [])
+        if isinstance(item, dict)
+    }
+    for i, slot in enumerate(slot_names):
         if i + 1 >= len(grid):
             break
         row = grid[i + 1]
+        item = by_time.get(slot, {})
         for col, field in (
             (0, "time"), (1, "activity"), (2, "activity_process"),
             (3, "child_response"), (4, "teacher_support"), (5, "remarks")
         ):
             if col < len(row):
-                put(row[col], item.get(field, ""))
+                put(row[col], slot if field == "time" else item.get(field, ""))
 
     # The evaluation section of the supplied template is intended for the
     # evaluation and next-step plan, not a repeat of all other diary fields.
