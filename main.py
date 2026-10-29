@@ -1,6 +1,7 @@
 import os
 import base64
 import json
+import re
 import psycopg
 from psycopg.rows import dict_row
 from psycopg import sql as pgsql
@@ -16,6 +17,7 @@ from datetime import timedelta
 
 from contextlib import contextmanager
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import bcrypt
 
@@ -41,9 +43,6 @@ from pydantic import (
 )
 
 from hwpx_generator import generate_hwpx
-
-# Timezone 라이브러리 추가
-from zoneinfo import ZoneInfo
 
 # =========================================================
 # 기본 설정
@@ -83,11 +82,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-KST = ZoneInfo("Asia/Seoul")
 
 # =========================================================
 # 공통 함수
 # =========================================================
+
+KST = ZoneInfo("Asia/Seoul")
+
 
 def now_text():
     return datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
@@ -867,46 +868,103 @@ def guardian_child(guardian_id: int, user=Depends(require_guardian)):
 
 
 # =========================================================
-# AI 개별 유아 보육일지 생성
+# AI 개별 유아 보육일지 생성 + 시간대별 검증
 # =========================================================
+
+# 정시별 9개 슬롯이 HWPX 양식의 9개 행과 1:1로 대응합니다.
+# AI가 일부 슬롯만 반환하거나 순서가 바뀌어도 시간값 기준으로 처리합니다.
+DIARY_SLOT_TIMES = [f"{hour:02d}:00~{hour + 1:02d}:00" for hour in range(9, 18)]
+SCHEDULE_KEYS = ("activity", "activity_process", "child_response", "teacher_support", "remarks")
+TIME_RANGE = re.compile(r"(?<![0-9])([01]?[0-9]|2[0-3])\s*[:：]\s*([0-5][0-9])\s*[~∼～\-–—]\s*([01]?[0-9]|2[0-3])\s*[:：]\s*([0-5][0-9])(?![0-9])")
+TIME_POINT = re.compile(r"(?<![0-9])([01]?[0-9]|2[0-3])\s*[:：]\s*([0-5][0-9])(?![0-9])")
+
+
+def _slots_for_time_label(label: str) -> list[str]:
+    """Return the hour slots overlapping an explicitly written time/range."""
+    match = TIME_RANGE.search(str(label))
+    if match:
+        start_hour, start_min, end_hour, end_min = (int(v) for v in match.groups())
+        start = start_hour * 60 + start_min
+        end = end_hour * 60 + end_min
+        if end <= start:  # 날짜가 넘어가는 시간은 양식에 임의 배정하지 않음
+            return []
+        return [
+            f"{hour:02d}:00~{hour + 1:02d}:00"
+            for hour in range(9, 18)
+            if start < (hour + 1) * 60 and end > hour * 60
+        ]
+    point = TIME_POINT.search(str(label))
+    if point:
+        hour = int(point.group(1))
+        if 9 <= hour < 18:
+            return [f"{hour:02d}:00~{hour + 1:02d}:00"]
+    return []
+
+
+def _ocr_explicit_slots(note: str) -> set[str]:
+    """Only identify slots for explicit numeric times in the OCR text."""
+    referenced = set()
+    for match in TIME_RANGE.finditer(note):
+        referenced.update(_slots_for_time_label(match.group(0)))
+    # Prevent the end boundary of an interval from counting as a new activity.
+    remaining = TIME_RANGE.sub(' ', note)
+    for match in TIME_POINT.finditer(remaining):
+        referenced.update(_slots_for_time_label(match.group(0)))
+    return referenced
+
+
+def _empty_schedule() -> list[dict]:
+    return [{"time": slot, **{key: "" for key in SCHEDULE_KEYS}} for slot in DIARY_SLOT_TIMES]
+
+
+def _normalize_ai_schedule(raw_schedule) -> list[dict]:
+    """Align sparse, unordered, or minute-specific AI entries to template rows."""
+    timetable = {row["time"]: row for row in _empty_schedule()}
+    if not isinstance(raw_schedule, list):
+        return list(timetable.values())
+    for item in raw_schedule:
+        if not isinstance(item, dict):
+            continue
+        # Ex: 09:30~10:20 correctly overlaps both 09~10 and 10~11.
+        slots = _slots_for_time_label(str(item.get('time', '')))
+        for slot in slots:
+            dest = timetable[slot]
+            for key in SCHEDULE_KEYS:
+                value = str(item.get(key) or '').strip()
+                if value and value not in dest[key].split('\n'):
+                    dest[key] = (dest[key] + '\n' + value).strip() if dest[key] else value
+    return list(timetable.values())
+
+
+def _parse_ai_json(text: str) -> dict:
+    raw = text.strip()
+    if raw.startswith('```'):
+        raw = raw.replace('```json', '').replace('```JSON', '').replace('```', '').strip()
+    obj = json.loads(raw)
+    if not isinstance(obj, dict):
+        raise ValueError('AI 응답이 JSON 객체가 아닙니다.')
+    return obj
+
 
 @app.post("/generate")
 def generate_diary(data: GenerateDiaryInput, user=Depends(require_teacher)):
-
     ocr_text = data.text.strip()
-
     if not ocr_text:
-
-        raise HTTPException(
-            status_code=400,
-            detail="교사 메모 내용이 없습니다.",
-        )
-
+        raise HTTPException(status_code=400, detail="교사 메모 내용이 없습니다.")
     if client is None:
+        raise HTTPException(status_code=503, detail="OpenAI API Key가 설정되지 않았습니다.")
 
-        raise HTTPException(
-            status_code=503,
-            detail="OpenAI API Key가 설정되지 않았습니다.",
-        )
-
+    slot_blueprint = json.dumps(_empty_schedule(), ensure_ascii=False)
     prompt = f"""
-너는 어린이집 교사의 개별 유아 보육일지 작성 보조 AI이다.
-다음 OCR 교사 메모에 기록된 사실만 근거로 보육일지를 작성하라.
-없는 시간, 놀이, 발화, 교사의 행동을 만들어내지 마라.
-시간이 없는 내용은 시간대별 schedule에 임의 배정하지 말고 하단 서술 항목에만 반영하라.
-명확한 시각이나 시간 범위가 기록된 활동만 schedule에 넣어라.
-동일 시간대에 여러 활동이 있으면 같은 시간 슬롯에 합쳐도 된다.
-09:00~18:00의 각 정시 구간에 겹치는 기록만 배치한다.
-기록된 시간 범위를 넘어 활동을 확장하지 않는다.
-교사의 기대는 원본 메모에 근거한 교육적 기대를 작성하되 근거가 없으면 빈 문자열로 둔다.
-생활주제, 주제, 소주제도 원본 메모에 근거해 간결하게 작성하고, 불분명하면 빈 문자열로 둔다.
-특이사항이 없으면 빈 문자열로 둔다. 의학적 진단을 추측하지 마라.
+너는 어린이집 교사의 개별 유아 보육일지 작성을 돕는 AI이다.
+아래 [교사 메모 OCR]에 실제로 기록된 사실만 사용하라.
+새로운 놀이, 시간, 유아의 발화, 교사의 행동을 추측해서 만들지 마라.
 
-[기본 정보]
+[유아 정보]
 유아명: {data.child_name}
 반명: {data.class_name}
 연령: {data.age}
-교사: {data.teacher_name}
+담당교사: {data.teacher_name}
 생활주제 참고: {data.life_theme}
 주제 참고: {data.theme}
 소주제 참고: {data.subtheme}
@@ -915,107 +973,83 @@ def generate_diary(data: GenerateDiaryInput, user=Depends(require_teacher)):
 [교사 메모 OCR]
 {ocr_text}
 
-반드시 다음 JSON 객체만 출력한다. 마크다운 금지.
-키 이름은 영문 그대로 유지한다.
-각 schedule 원소의 time은 '09:00~10:00' 같은 정시 구간이며
-activity=일과 및 활동, activity_process=활동내용 및 실행,
-child_response=유아의 놀이모습, teacher_support=교사의 지원 및 평가,
-remarks=비고이다.
-확인되지 않은 세부 내용은 빈 문자열로 둔다.
-{{
- "life_theme": "", "theme": "", "subtheme": "", "teacher_expectation": "",
- "schedule": [{{"time": "09:00~10:00", "activity": "", "activity_process": "", "child_response": "", "teacher_support": "", "remarks": ""}}],
- "main_activity": "", "activity_process": "", "child_response": "",
- "teacher_support": "", "observation_evaluation": "", "future_support": "",
- "special_notes": "", "family_connection": ""
-}}
+[시간표 작성 규칙 - 중요]
+1. 09:00~10:00부터 17:00~18:00까지 아래 JSON의 9개 시간대 모두를 반드시 반환한다.
+2. OCR 메모에 여러 시간대가 있다면 일부만 작성하지 말고 모두 검토해 해당 구간에 채워라.
+3. 09:30~10:20의 활동은 실제 시간이 겹치는 09~10시와 10~11시 구간 모두에 기술할 수 있다.
+4. 10:30~10:50, 10:50~11:10 등 세부 시간은 해당 정시 구간에 정확히 배치한다.
+5. 시간 구간에 대응하는 기록이 없으면 그 구간의 다른 값은 모두 빈 문자열로 둔다.
+6. 일과 및 활동(activity), 활동내용 및 실행(activity_process), 유아의 놀이모습(child_response),
+   교사의 지원 및 평가(teacher_support), 비고(remarks)를 각각 근거에 따라 채워라.
+7. 서로 다른 시간대를 하나의 시간대에 모두 몰아서 작성하지 마라.
+8. 생활주제, 주제, 소주제, 교사의 기대 및 하단 서술 항목도 기록에 근거해서 작성하라.
+9. 특이사항이 없으면 빈 문자열로 둔다. 의학적 진단이나 확인되지 않은 사실을 추가하지 마라.
+10. 모든 값을 한국어 문장으로 쓰되 JSON 키 이름과 time 값은 정확히 유지하라.
+
+[반환 구조]
+반드시 JSON 객체 하나만 반환하고 마크다운이나 설명을 붙이지 마라.
+"life_theme", "theme", "subtheme", "teacher_expectation"과
+"main_activity", "activity_process", "child_response", "teacher_support",
+"observation_evaluation", "future_support", "special_notes", "family_connection"은 문자열이다.
+"schedule"은 반드시 다음의 9개 원소를 모두 포함해야 한다.
+{slot_blueprint}
 """
 
     try:
+        response = client.responses.create(model=OPENAI_MODEL, input=prompt)
+        result = _parse_ai_json(response.output_text)
 
-        response = client.responses.create(
-            model=OPENAI_MODEL,
-            input=prompt,
-        )
-
-        output = response.output_text.strip()
-
-        # 혹시 모델이 코드블록을 붙였을 경우 제거
-        if output.startswith("```"):
-
-            output = output.replace(
-                "```json",
-                "",
-            )
-
-            output = output.replace(
-                "```",
-                "",
-            )
-
-            output = output.strip()
-
-        result = json.loads(output)
-
-        fields = [
+        fields = (
             "life_theme", "theme", "subtheme", "teacher_expectation",
             "main_activity", "activity_process", "child_response", "teacher_support",
             "observation_evaluation", "future_support", "special_notes", "family_connection",
-        ]
-        clean_result = {}
-        for field in fields:
-            value = result.get(field, "")
-            clean_result[field] = str(value).strip() if value is not None else ""
+        )
+        clean_result = {
+            field: str(result.get(field) or '').strip() for field in fields
+        }
+        clean_result['schedule'] = _normalize_ai_schedule(result.get('schedule'))
 
-        # AI가 만든 시간대 중 09~18시 정시 구간만 허용
-        valid_times = {f"{h:02d}:00~{h+1:02d}:00" for h in range(9, 18)}
-        clean_result["schedule"] = []
-        for item in result.get("schedule", []):
-            if not isinstance(item, dict):
-                continue
-            time = str(item.get("time", "")).strip().replace(" ", "")
-            if time not in valid_times:
-                continue
-            clean_result["schedule"].append({
-                key: str(item.get(key) or "").strip()
-                for key in ("time", "activity", "activity_process", "child_response", "teacher_support", "remarks")
-            } | {"time": time})
+        # If the OCR clearly mentions other hours but the AI missed them,
+        # make one targeted repair request instead of silently losing the day.
+        expected = _ocr_explicit_slots(ocr_text)
+        populated = {
+            row['time'] for row in clean_result['schedule']
+            if any(row.get(field) for field in SCHEDULE_KEYS)
+        }
+        missing = sorted(expected - populated)
+        if missing:
+            try:
+                repair_prompt = (
+                    "다음 교사 OCR 메모에 명시된 시간대 중 첫 응답에서 누락된 시간대만 보완하라. "
+                    "확인되지 않은 사실은 절대 추가하지 말고 빈 문자열로 둔다. "
+                    "schedule 배열만 포함한 JSON 객체 하나를 반환하라. "
+                    "time은 해당 정시 구간 그대로, 각 원소는 time, activity, activity_process, "
+                    "child_response, teacher_support, remarks를 포함한다.\n"
+                    f"누락된 정시 구간: {', '.join(missing)}\n"
+                    f"OCR 메모:\n{ocr_text}"
+                )
+                repaired = _parse_ai_json(
+                    client.responses.create(model=OPENAI_MODEL, input=repair_prompt).output_text
+                )
+                additions = _normalize_ai_schedule(repaired.get('schedule'))
+                by_time = {row['time']: row for row in clean_result['schedule']}
+                for row in additions:
+                    if row['time'] not in missing:
+                        continue
+                    for key in SCHEDULE_KEYS:
+                        if row[key] and not by_time[row['time']][key]:
+                            by_time[row['time']][key] = row[key]
+            except Exception as exc:
+                # 보완 API가 실패해도 정상 생성된 내용까지 잃지 않게 유지한다.
+                print('AI timetable repair skipped:', type(exc).__name__, flush=True)
         return clean_result
 
-    except json.JSONDecodeError as e:
-
-        print("JSON PARSE ERROR:", repr(e))
-        print("AI RAW OUTPUT:", output)
-
-        raise HTTPException(
-            status_code=502,
-            detail="AI 응답을 보육일지 형식으로 변환하지 못했습니다.",
-        )
-
-    except Exception as e:
-        import traceback
-
-        print("========== OPENAI ERROR ==========", flush=True)
-        print("ERROR TYPE:", type(e).__name__, flush=True)
-        print("ERROR MESSAGE:", str(e), flush=True)
-
-        cause = e.__cause__
-        while cause is not None:
-            print(
-                "CAUSE:",
-                type(cause).__name__,
-                str(cause),
-                flush=True,
-            )
-            cause = cause.__cause__
-
-        traceback.print_exc()
-        print("==================================", flush=True)
-
-        raise HTTPException(
-            status_code=502,
-            detail="AI 보육일지 생성 중 오류가 발생했습니다.",
-        )
+    except (json.JSONDecodeError, ValueError) as exc:
+        print('AI JSON format error:', type(exc).__name__, flush=True)
+        raise HTTPException(status_code=502, detail="AI 응답을 보육일지 형식으로 변환하지 못했습니다.") from exc
+    except Exception as exc:
+        print('AI generation error:', type(exc).__name__, str(exc)[:250], flush=True)
+        raise HTTPException(status_code=502, detail="AI 보육일지 생성 중 오류가 발생했습니다.") from exc
 
 
 # =========================================================
